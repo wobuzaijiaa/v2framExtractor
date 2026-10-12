@@ -6,8 +6,8 @@ There are two separate programs, and their timestamps mean different things:
 
 | Program | Timestamp is | Use when |
 |---|---|---|
-| `pts_extractor.py` | PTS of the actual selected source frame | source-frame timing matters |
-| `fps_extractor.py` | Requested output sampling time | a simple regular sampling timeline is enough |
+| `extractor_ui_pts.py` | PTS of the actual selected source frame | source-frame timing matters |
+| `extractor_ui_fps.py` | Requested output sampling time | a simple regular sampling timeline is enough |
 
 ## Timestamps
 
@@ -32,8 +32,8 @@ Tested with: Python 3.11, FFmpeg 7.x, Windows 11.
 ## Usage
 
 ~~~bash
-python pts_extractor.py
-python fps_extractor.py
+python extractor_ui_pts.py
+python extractor_ui_fps.py
 ~~~
 
 Select a video, set FPS (the grid rate for PTS-based, the output rate for FPS-grid), then click **Extract**. JPEGs and the corresponding log file are written to the output folder. Existing files with the same generated name are overwritten.
