@@ -1,13 +1,13 @@
-# Video Frame Extractor
+# Timestamped Video Frame Extractor
 
 A small Python/Tkinter tool that extracts JPEG frames from video and timestamps each image (filename, EXIF, and optionally Windows file times) using the video's recording-start metadata.
 
 There are two separate programs, and their timestamps mean different things:
 
-| Program | Timestamp is | Use when |
-|---|---|---|
-| `extractor_ui_pts.py` | PTS of the actual selected source frame | source-frame timing matters |
-| `extractor_ui_fps.py` | Requested output sampling time | a simple regular sampling timeline is enough |
+| Program                    | Timestamp is                            | Use when                                     |
+| -------------------------- | --------------------------------------- | -------------------------------------------- |
+| `extractor_ui_pts_diag.py` | PTS of the actual selected source frame | source-frame timing matters                  |
+| `extractor_ui_fps_diag.py` | Requested output sampling time          | a simple regular sampling timeline is enough |
 
 ## Timestamps
 
@@ -32,8 +32,8 @@ Tested with: Python 3.11, FFmpeg 7.x, Windows 11.
 ## Usage
 
 ~~~bash
-python extractor_ui_pts.py
-python extractor_ui_fps.py
+python extractor_ui_pts_diag.py
+python extractor_ui_fps_diag.py
 ~~~
 
 Select a video, set FPS (the grid rate for PTS-based, the output rate for FPS-grid), then click **Extract**. JPEGs and the corresponding log file are written to the output folder. Existing files with the same generated name are overwritten.
