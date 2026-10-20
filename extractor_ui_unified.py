@@ -37,6 +37,9 @@ import time
 import json
 import math
 import shutil
+import tempfile
+import uuid
+import hashlib
 import csv
 import tkinter as tk
 
@@ -83,6 +86,7 @@ FPS_LOG_NAME = "fps_extraction_log.log"
 
 MANIFEST_CSV_NAME = "frame_manifest.csv"
 MANIFEST_JSON_NAME = "frame_manifest.json"
+RUN_METADATA_NAME = "extraction_run_metadata.json"
 
 SET_WINDOWS_FILE_TIMESTAMPS = False
 SET_WINDOWS_CREATED_TIME = True
@@ -340,6 +344,18 @@ def set_windows_file_timestamps(filepath,
     FILE_SHARE_WRITE = 0x00000002
     OPEN_EXISTING = 3
     kernel32 = ctypes.windll.kernel32
+    from ctypes import wintypes
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.SetFileTime.argtypes = [
+        wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p
+    ]
+    kernel32.SetFileTime.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
 
     handle = kernel32.CreateFileW(
         filepath,
@@ -350,7 +366,7 @@ def set_windows_file_timestamps(filepath,
         0,
         None,
     )
-    if handle == -1:
+    if handle == wintypes.HANDLE(-1).value:
         raise ctypes.WinError()
     try:
         class FILETIME(ctypes.Structure):
@@ -587,6 +603,28 @@ def get_video_info(video_path):
         except (ValueError, TypeError):
             pass
 
+    average_fps = None
+    avg_rate_text = video_stream.get("avg_frame_rate")
+    if avg_rate_text and "/" in avg_rate_text:
+        num, den = avg_rate_text.split("/", 1)
+        try:
+            num, den = float(num), float(den)
+            if den != 0:
+                average_fps = num / den
+        except (ValueError, TypeError):
+            pass
+
+    average_fps = None
+    avg_rate_text = video_stream.get("avg_frame_rate")
+    if avg_rate_text and "/" in avg_rate_text:
+        num, den = avg_rate_text.split("/", 1)
+        try:
+            num, den = float(num), float(den)
+            if den != 0:
+                average_fps = num / den
+        except (ValueError, TypeError):
+            pass
+
     time_base = None
     tb_text = video_stream.get("time_base")
     if tb_text and "/" in tb_text:
@@ -621,6 +659,7 @@ def get_video_info(video_path):
     return {
         "duration": duration,
         "source_fps": source_fps,
+        "avg_frame_rate": average_fps,
         "width": width,
         "height": height,
         "codec": codec,
@@ -690,21 +729,73 @@ def write_frame_exif(filepath, frame_time, video_path, method="pts"):
 
 
 def write_frame_manifest(output_folder, records):
-    """Writes the frame metadata to both CSV and JSON formats."""
+    """Atomically replace CSV and JSON manifests after complete serialization."""
     if not records:
         return None, None
-        
+
     csv_path = os.path.join(output_folder, MANIFEST_CSV_NAME)
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=records[0].keys())
-        writer.writeheader()
-        writer.writerows(records)
-        
     json_path = os.path.join(output_folder, MANIFEST_JSON_NAME)
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(records, f, indent=2)
-        
+    token = uuid.uuid4().hex
+    csv_tmp = csv_path + "." + token + ".tmp"
+    json_tmp = json_path + "." + token + ".tmp"
+    fields = list(dict.fromkeys(
+        key for record in records for key in record.keys()
+    ))
+    try:
+        with open(csv_tmp, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fields, extrasaction="raise")
+            writer.writeheader()
+            writer.writerows(records)
+            f.flush()
+            os.fsync(f.fileno())
+        with open(json_tmp, "w", encoding="utf-8") as f:
+            json.dump(records, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        # Each replacement is atomic; a filesystem cannot atomically replace
+        # two independent files, so run metadata marks the committed result.
+        os.replace(csv_tmp, csv_path)
+        os.replace(json_tmp, json_path)
+    finally:
+        for path in (csv_tmp, json_tmp):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
     return csv_path, json_path
+
+
+def to_utc_iso(timestamp):
+    """Return an ISO-8601 UTC timestamp with an explicit +00:00 offset."""
+    return timestamp.astimezone(timezone.utc).isoformat()
+
+
+def sha256_file(filepath, chunk_size=1024 * 1024):
+    digest = hashlib.sha256()
+    with open(filepath, "rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_run_metadata(output_folder, metadata):
+    """Write run-level metadata atomically; status should be complete only at commit."""
+    path = os.path.join(output_folder, RUN_METADATA_NAME)
+    tmp = path + "." + uuid.uuid4().hex + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2, ensure_ascii=False, default=str)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+    return path
 
 
 def apply_windows_timestamps_batch(timestamp_records, progress_callback=None):
@@ -725,22 +816,10 @@ def apply_windows_timestamps_batch(timestamp_records, progress_callback=None):
 
 
 def cleanup_temp_folder(temp_folder):
-    if not os.path.isdir(temp_folder):
+    """Remove a temporary extraction directory; surface cleanup failures."""
+    if not os.path.exists(temp_folder):
         return
-    try:
-        for filename in os.listdir(temp_folder):
-            filepath = os.path.join(temp_folder, filename)
-            if os.path.isfile(filepath):
-                try:
-                    os.remove(filepath)
-                except OSError:
-                    pass
-        try:
-            os.rmdir(temp_folder)
-        except OSError:
-            pass
-    except OSError:
-        pass
+    shutil.rmtree(temp_folder)
 
 
 def calculate_expected_frame_count(duration, fps):
@@ -790,9 +869,8 @@ def get_source_frame_pts(video_path, stream_ordinal=0, stats=None):
         if "D" in (pkt.get("flags") or ""):
             discarded += 1
             continue
+        # DTS is decode time and must not be substituted for presentation time.
         pts = _to_float_or_none(pkt.get("pts_time"))
-        if pts is None:
-            pts = _to_float_or_none(pkt.get("dts_time"))
         if pts is None:
             unusable += 1
             continue
@@ -806,8 +884,8 @@ def get_source_frame_pts(video_path, stream_ordinal=0, stats=None):
     if unusable:
         # Skipping them silently would shift every later frame index.
         raise RuntimeError(
-            f"{unusable} video packet(s) have neither a usable PTS nor "
-            "DTS. Frame indices cannot be trusted for this file, so "
+            f"{unusable} video packet(s) have no usable presentation PTS. "
+            "Frame indices cannot be trusted for this file, so "
             "PTS-grid extraction was stopped.\n\n"
             "Use the FPS grid method, or remux the video first.")
     if not source_pts:
@@ -1199,10 +1277,7 @@ def extract_frames_pts(video_path, output_folder, fps,
     selection_error_stats = summarize_selection_errors(
         [r[3] for r in selection_error_records])
 
-    temp_folder = os.path.join(output_folder, "_temp_frames")
-    os.makedirs(temp_folder, exist_ok=True)
-    cleanup_temp_folder(temp_folder)
-    os.makedirs(temp_folder, exist_ok=True)
+    temp_folder = tempfile.mkdtemp(prefix="_temp_frames_", dir=output_folder)
     temp_pattern = os.path.join(temp_folder, "frame_%08d.jpg")
 
     try:
@@ -1230,7 +1305,9 @@ def extract_frames_pts(video_path, output_folder, fps,
             temp_file = temp_files[index]
 
             if os.path.exists(output_file):
-                os.remove(output_file)
+                raise FileExistsError(
+                    f"Refusing to overwrite existing frame: {output_file}. "
+                    "Choose a clean output folder or delete prior frames.")
             os.replace(temp_file, output_file)
 
             jpeg_bytes = os.path.getsize(output_file)
@@ -1239,16 +1316,25 @@ def extract_frames_pts(video_path, output_folder, fps,
             manifest_records.append({
                 "image_id": frame_number,
                 "file_name": output_filename,
-                "timestamp_utc": frame_time.isoformat(),
+                "timestamp_utc": to_utc_iso(frame_time),
                 "timestamp_unix": frame_time.timestamp(),
                 "width": info["width"],
                 "height": info["height"],
                 "file_size_bytes": jpeg_bytes,
                 "frame_type": "pts_native",
-                "source_video": os.path.basename(video_path)
+                "sampling_method": "pts_grid",
+                "requested_fps": fps,
+                "source_frame_index": selected_frames[index].get("index"),
+                "actual_pts_seconds": actual_frame_pts,
+                "target_grid_pts_seconds": selected_frames[index].get("target_pts"),
+                "source_video": os.path.basename(video_path),
+                "source_video_path": os.path.abspath(video_path),
+                "file_sha256": sha256_file(output_file)
             })
 
             write_frame_exif(output_file, frame_time, video_path, "pts")
+            manifest_records[-1]["file_size_bytes"] = os.path.getsize(output_file)
+            manifest_records[-1]["file_sha256"] = sha256_file(output_file)
 
             if SET_WINDOWS_FILE_TIMESTAMPS:
                 timestamp_records.append((output_file, frame_time))
@@ -1259,6 +1345,29 @@ def extract_frames_pts(video_path, output_folder, fps,
         exif_seconds = time.perf_counter() - exif_start
 
         write_frame_manifest(output_folder, manifest_records)
+        write_run_metadata(output_folder, {
+            "schema_version": 2,
+            "run_id": uuid.uuid4().hex,
+            "status": "complete",
+            "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+            "sampling_method": "pts_grid",
+            "requested_fps": fps,
+            "source_video": os.path.basename(video_path),
+            "source_video_path": os.path.abspath(video_path),
+            "source_video_size_bytes": os.path.getsize(video_path),
+            "source_video_sha256": sha256_file(video_path),
+            "recording_start_iso8601": recording_start.isoformat(),
+            "recording_start_utc": to_utc_iso(recording_start),
+            "duration_seconds": info["duration"],
+            "source_fps_nominal": info["source_fps"],
+            "source_fps_average": info.get("avg_frame_rate"),
+            "width": info["width"],
+            "height": info["height"],
+            "codec": info["codec"],
+            "ffmpeg_executable": _FFMPEG_EXE,
+            "ffprobe_executable": _FFPROBE_EXE,
+            "frame_count": len(manifest_records),
+        })
 
         jpeg_stats = summarize_jpeg_sizes([r[2] for r in jpeg_records])
 
@@ -1326,7 +1435,7 @@ def extract_frames_pts(video_path, output_folder, fps,
             handle.write("Sampling: fixed target PTS grid\n")
             handle.write("Source frame selection: nearest source PTS\n")
             handle.write("FFmpeg selection: Balanced BST expression tree\n")
-            handle.write("FFmpeg showinfo: NOT USED\n")
+            handle.write("FFmpeg showinfo: used for post-extraction verification only; not for timestamp calculation\n")
             handle.write("FFprobe source PTS: AUTHORITATIVE FOR "
                          "TIMESTAMP CALCULATION (Packet-based)\n")
             handle.write("Generic fps filter replacement: NOT USED\n")
@@ -1454,6 +1563,16 @@ def extract_frames_fps(video_path, output_folder, fps,
     total_start = time.perf_counter()
     fps = validate_fps(fps)
     os.makedirs(output_folder, exist_ok=True)
+    write_run_metadata(output_folder, {
+        "schema_version": 2,
+        "run_id": uuid.uuid4().hex,
+        "status": "running",
+        "started_at_utc": datetime.now(timezone.utc).isoformat(),
+        "sampling_method": "fps_grid",
+        "source_video": os.path.basename(video_path),
+        "source_video_path": os.path.abspath(video_path),
+        "note": "Not complete until status changes to complete."
+    })
 
     log_lines = []
 
@@ -1492,8 +1611,11 @@ def extract_frames_fps(video_path, output_folder, fps,
     for line in describe_recording_start(info):
         append_log(line)
     append_log(f"Duration: {duration:.3f} s")
-    append_log("Source FPS (nominal): "
+    append_log("Source FPS (nominal r_frame_rate): "
                + (f"{source_fps:.6f}" if source_fps else "unknown"))
+    avg_fps = info.get("avg_frame_rate")
+    append_log("Source FPS (average avg_frame_rate): "
+               + (f"{avg_fps:.6f}" if avg_fps else "unknown"))
     append_log(f"Resolution: {info['width']} x {info['height']}")
     append_log(f"Codec: {info['codec']}")
     append_log("EXIF OffsetTime tags: "
@@ -1509,9 +1631,7 @@ def extract_frames_fps(video_path, output_folder, fps,
         append_log("Use the PTS grid method to avoid duplicates.")
     append_log("")
 
-    temp_folder = os.path.join(output_folder, "_temp_frames")
-    cleanup_temp_folder(temp_folder)
-    os.makedirs(temp_folder, exist_ok=True)
+    temp_folder = tempfile.mkdtemp(prefix="_temp_frames_", dir=output_folder)
     temp_pattern = os.path.join(temp_folder, "frame_%08d.jpg")
 
     # Explicit stream selection: the same video stream that
@@ -1575,7 +1695,7 @@ def extract_frames_fps(video_path, output_folder, fps,
             flush_log()
             raise RuntimeError("FFmpeg did not produce any JPEG frames.")
 
-        usable_count = min(produced_count, expected_count)
+        usable_count = produced_count
         timestamp_records = []
         per_frame_records = []
         manifest_records = []
@@ -1592,7 +1712,9 @@ def extract_frames_fps(video_path, output_folder, fps,
             temp_file = temp_files[index]
 
             if os.path.exists(output_file):
-                os.remove(output_file)
+                raise FileExistsError(
+                    f"Refusing to overwrite existing frame: {output_file}. "
+                    "Choose a clean output folder or delete prior frames.")
             os.replace(temp_file, output_file)
 
             file_size_bytes = os.path.getsize(output_file)
@@ -1606,16 +1728,24 @@ def extract_frames_fps(video_path, output_folder, fps,
             manifest_records.append({
                 "image_id": frame_number,
                 "file_name": output_filename,
-                "timestamp_utc": sampling_time.isoformat(),
+                "timestamp_utc": to_utc_iso(sampling_time),
                 "timestamp_unix": sampling_time.timestamp(),
                 "width": info["width"],
                 "height": info["height"],
                 "file_size_bytes": file_size_bytes,
                 "frame_type": "fps_sampled",
-                "source_video": os.path.basename(video_path)
+                "sampling_method": "fps_grid",
+                "requested_fps": fps,
+                "sampling_index": index,
+                "nominal_sampling_time_seconds": index / fps,
+                "source_video": os.path.basename(video_path),
+                "source_video_path": os.path.abspath(video_path),
+                "file_sha256": sha256_file(output_file)
             })
 
             write_frame_exif(output_file, sampling_time, video_path, "fps")
+            manifest_records[-1]["file_size_bytes"] = os.path.getsize(output_file)
+            manifest_records[-1]["file_sha256"] = sha256_file(output_file)
 
             if SET_WINDOWS_FILE_TIMESTAMPS:
                 timestamp_records.append((output_file, sampling_time))
@@ -1626,6 +1756,31 @@ def extract_frames_fps(video_path, output_folder, fps,
         exif_seconds = time.perf_counter() - exif_start
 
         write_frame_manifest(output_folder, manifest_records)
+        write_run_metadata(output_folder, {
+            "schema_version": 2,
+            "run_id": uuid.uuid4().hex,
+            "status": "complete",
+            "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+            "sampling_method": "fps_grid",
+            "requested_fps": fps,
+            "expected_frame_count_estimate": expected_count,
+            "ffmpeg_produced_frame_count": produced_count,
+            "source_video": os.path.basename(video_path),
+            "source_video_path": os.path.abspath(video_path),
+            "source_video_size_bytes": os.path.getsize(video_path),
+            "source_video_sha256": sha256_file(video_path),
+            "recording_start_iso8601": recording_start.isoformat(),
+            "recording_start_utc": to_utc_iso(recording_start),
+            "duration_seconds": duration,
+            "source_fps_nominal": info.get("source_fps"),
+            "source_fps_average": info.get("avg_frame_rate"),
+            "width": info["width"],
+            "height": info["height"],
+            "codec": info["codec"],
+            "ffmpeg_executable": _FFMPEG_EXE,
+            "ffprobe_executable": _FFPROBE_EXE,
+            "frame_count": len(manifest_records),
+        })
 
         filesystem_start = time.perf_counter()
         if SET_WINDOWS_FILE_TIMESTAMPS:
@@ -1639,7 +1794,7 @@ def extract_frames_fps(video_path, output_folder, fps,
         append_log("RESULT: SUCCESS")
         append_log("")
         append_log("COUNTS:")
-        append_log(f"  Expected output frames: {expected_count}")
+        append_log(f"  Estimated output frames: {expected_count}")
         append_log(f"  FFmpeg produced:        {produced_count}")
         append_log(f"  Used:                   {usable_count}")
         if produced_count != expected_count:
@@ -1649,9 +1804,7 @@ def extract_frames_fps(video_path, output_folder, fps,
             append_log("  FFmpeg's actual output count is authoritative for")
             append_log("  the generated files. No source-PTS correction is "
                        "applied.")
-            if produced_count > expected_count:
-                append_log(f"  {produced_count - expected_count} surplus "
-                           "frame(s) were NOT written to the output folder.")
+            append_log("  All FFmpeg-produced frames are retained.")
         append_log("")
         append_log("TIMINGS:")
         append_log(f"  FFmpeg extraction:   {ffmpeg_seconds:.6f} s")
@@ -1679,6 +1832,21 @@ def extract_frames_fps(video_path, output_folder, fps,
         if not failure_logged:
             append_log("RESULT: FAILED")
             append_log(f"{type(exc).__name__}: {exc}")
+            try:
+                write_run_metadata(output_folder, {
+                    "schema_version": 2,
+                    "run_id": uuid.uuid4().hex,
+                    "status": "failed",
+                    "failed_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "sampling_method": "fps_grid",
+                    "source_video": os.path.basename(video_path),
+                    "source_video_path": os.path.abspath(video_path),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "note": "Output may be partial; do not treat as a complete dataset."
+                })
+            except OSError:
+                pass
             try:
                 flush_log()
             except OSError:
@@ -2136,7 +2304,7 @@ class VideoFrameExtractorApp:
                 metadata.append(
                     " filename  EXIF  Windows timestamps")
                 metadata.append("")
-                metadata.append("FFmpeg showinfo: NOT used")
+                metadata.append("FFmpeg showinfo: used for verification only, not timestamp calculation")
                 metadata.append(
                     "FFprobe source PTS: authoritative for "
                     "timestamp calculation (Packet-based)")
@@ -2355,8 +2523,8 @@ class VideoFrameExtractorApp:
                 f"{len(existing_frames)} frame JPEG(s) from an earlier "
                 "run.\n\nLeaving them would mix old and new frames "
                 "(different FPS or method give different filenames).\n\n"
-                "Yes = delete them first\n"
-                "No = keep them (outputs will be mixed)\n"
+                "Yes = delete existing frame JPEGs first\n"
+                "No = keep existing files; any filename collision aborts\n"
                 "Cancel = abort")
             if answer is None:
                 return
