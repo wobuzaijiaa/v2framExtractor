@@ -16,6 +16,11 @@ Two extraction methods, selectable from the UI:
 
 Both modes write filename, EXIF, and (optionally) Windows
 filesystem timestamps from the SAME calculated frame_time.
+They also generate a manifest (CSV + JSON) containing metadata
+for each extracted frame, which is useful for downstream SFM pipelines.
+
+ffmpeg-python is no longer required: every FFmpeg/FFprobe call goes
+through subprocess using the executable that was validated at startup.
 
 FFmpeg availability is checked at startup. If ffmpeg / ffprobe
 are not found on PATH, the user can point the application at
@@ -32,12 +37,12 @@ import time
 import json
 import math
 import shutil
+import csv
 import tkinter as tk
 
 from tkinter import filedialog, messagebox, ttk
 from datetime import datetime, timedelta, timezone
 
-import ffmpeg
 import piexif
 
 
@@ -76,6 +81,9 @@ PTS_BENCHMARK_LOG_NAME = "extraction_benchmark.log"
 PTS_FFMPEG_LOG_NAME = "ffmpeg_last_run.log"
 FPS_LOG_NAME = "fps_extraction_log.log"
 
+MANIFEST_CSV_NAME = "frame_manifest.csv"
+MANIFEST_JSON_NAME = "frame_manifest.json"
+
 SET_WINDOWS_FILE_TIMESTAMPS = False
 SET_WINDOWS_CREATED_TIME = True
 SET_WINDOWS_MODIFIED_TIME = True
@@ -83,6 +91,11 @@ SET_WINDOWS_ACCESSED_TIME = False
 
 JPEG_QUALITY = 2
 FILTER_SCRIPT_THRESHOLD = 20000
+
+MAX_EXTRACTION_FPS = 1000.0
+PTS_VERIFY_TOLERANCE_S = 0.0001
+OUTPUT_FRAME_PATTERN = re.compile(
+    r"^\d{8}_\d{6}_\d{3}_\d{6,}\.jpg$", re.IGNORECASE)
 
 SETTINGS_APP_NAME = "TimestampedVideoFrameExtractor"
 SETTINGS_FILENAME = "settings.json"
@@ -128,10 +141,38 @@ def save_settings(settings):
 
 
 # ============================================================
+# Input validation
+# ============================================================
+
+def validate_fps(value):
+    """Return a finite float in (0, MAX_EXTRACTION_FPS] or raise ValueError.
+
+    float() happily accepts 'inf' and 'nan', and both pass a plain
+    `fps <= 0` test; they made select_source_frames() loop forever.
+    """
+    try:
+        fps = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("FPS must be a number.")
+    if not math.isfinite(fps) or fps <= 0:
+        raise ValueError("FPS must be a finite number greater than zero.")
+    if fps > MAX_EXTRACTION_FPS:
+        raise ValueError(f"FPS must not exceed {MAX_EXTRACTION_FPS:g}.")
+    return fps
+
+
+# ============================================================
 # FFmpeg detection & PATH management
 # ============================================================
 
 _ORIGINAL_PATH = os.environ.get("PATH", "")
+
+# Executables used for EVERY subprocess call. configure_ffmpeg() sets
+# them from the detection result, so the binary that was validated is
+# the binary that runs (no second, independent PATH lookup).
+_FFMPEG_EXE = "ffmpeg"
+_FFPROBE_EXE = "ffprobe"
+_VFR_ARGS = ["-fps_mode", "vfr"]
 
 
 def set_custom_ffmpeg_folder(folder):
@@ -153,6 +194,10 @@ def _resolve_exe(name, folder):
     if os.path.isfile(candidate):
         return candidate
     return os.path.join(folder, name + suffix)
+
+
+def _decode_bytes(data):
+    return data.decode("utf-8", errors="replace") if data else ""
 
 
 def _run_version_command(exe):
@@ -183,6 +228,31 @@ def _run_version_command(exe):
     return version, None
 
 
+def _supports_fps_mode(ffmpeg_exe):
+    """True / False / None (could not be determined).
+
+    -fps_mode is needed by PTS mode. Probing the capability is more
+    reliable than parsing version strings (git builds, vendor suffixes).
+    """
+    command = [
+        ffmpeg_exe, "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "nullsrc=s=16x16:r=1:d=1",
+        "-frames:v", "1", "-fps_mode", "vfr", "-f", "null", "-",
+    ]
+    try:
+        result = subprocess.run(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=20)
+    except Exception:
+        return None
+    if result.returncode == 0:
+        return True
+    error_text = _decode_bytes(result.stderr).lower()
+    if "unrecognized option" in error_text and "fps_mode" in error_text:
+        return False
+    return None
+
+
 def detect_ffmpeg(custom_folder=None):
     if custom_folder:
         ffmpeg_exe = _resolve_exe("ffmpeg", custom_folder)
@@ -196,6 +266,10 @@ def detect_ffmpeg(custom_folder=None):
     ffmpeg_version, ffmpeg_error = _run_version_command(ffmpeg_exe)
     ffprobe_version, ffprobe_error = _run_version_command(ffprobe_exe)
 
+    fps_mode_supported = None
+    if ffmpeg_version is not None:
+        fps_mode_supported = _supports_fps_mode(ffmpeg_exe)
+
     return {
         "ok": ffmpeg_version is not None and ffprobe_version is not None,
         "source": source,
@@ -206,7 +280,41 @@ def detect_ffmpeg(custom_folder=None):
         "ffprobe_exe": ffprobe_exe,
         "ffprobe_version": ffprobe_version,
         "ffprobe_error": ffprobe_error,
+        "fps_mode_supported": fps_mode_supported,
     }
+
+
+def configure_ffmpeg(info):
+    """Make every later subprocess call use the validated executables."""
+    global _FFMPEG_EXE, _FFPROBE_EXE, _VFR_ARGS
+    if not info or not info.get("ok"):
+        return
+    _FFMPEG_EXE = info["ffmpeg_exe"]
+    _FFPROBE_EXE = info["ffprobe_exe"]
+    if info.get("fps_mode_supported") is False:
+        _VFR_ARGS = ["-vsync", "vfr"]      # FFmpeg < 5.1
+    else:
+        _VFR_ARGS = ["-fps_mode", "vfr"]
+
+
+def run_ffprobe_json(video_path, extra_args, what):
+    command = ([_FFPROBE_EXE, "-v", "error"] + list(extra_args)
+               + ["-of", "json", video_path])
+    try:
+        result = subprocess.run(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"FFprobe executable was not found: {_FFPROBE_EXE}")
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"FFprobe failed while reading {what}:\n\n"
+            + _decode_bytes(result.stderr))
+    try:
+        return json.loads(_decode_bytes(result.stdout))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Failed to parse FFprobe JSON output ({what}):\n\n{exc}")
 
 
 # ============================================================
@@ -275,19 +383,30 @@ def set_windows_file_timestamps(filepath,
 # Video datetime parsing (shared)
 # ============================================================
 
-def parse_video_datetime(value):
+def parse_video_datetime(value, meta=None):
+    """Parse a metadata datetime string.
+
+    If the string carries no timezone, the machine's local timezone is
+    assumed. When `meta` (a dict) is given, meta["tz_assumed"] is set so
+    the caller can report that assumption instead of hiding it.
+    """
     if not value:
         return None
+
+    def localize(dt):
+        if dt.tzinfo is None:
+            if meta is not None:
+                meta["tz_assumed"] = True
+            dt = dt.astimezone()
+        return dt
+
     value = str(value).strip()
     if (len(value) >= 19 and value[4] == ":" and value[7] == ":"):
         value = value[:4] + "-" + value[5:7] + "-" + value[8:]
     if value.endswith("Z"):
         value = value[:-1] + "+00:00"
     try:
-        dt = datetime.fromisoformat(value)
-        if dt.tzinfo is None:
-            dt = dt.astimezone()
-        return dt
+        return localize(datetime.fromisoformat(value))
     except ValueError:
         pass
     formats = [
@@ -300,10 +419,7 @@ def parse_video_datetime(value):
     ]
     for fmt in formats:
         try:
-            dt = datetime.strptime(value, fmt)
-            if dt.tzinfo is None:
-                dt = dt.astimezone()
-            return dt
+            return localize(datetime.strptime(value, fmt))
         except ValueError:
             continue
     return None
@@ -320,24 +436,33 @@ def find_tag(tags, *names):
     return None
 
 
+def find_tag_named(tags, *names):
+    """Like find_tag(), but also returns which tag name matched."""
+    if not tags:
+        return None, None
+    normalized = {str(k).lower().strip(): v for k, v in tags.items()}
+    for name in names:
+        v = normalized.get(str(name).lower().strip())
+        if v not in (None, "", "0000:00:00 00:00:00"):
+            return name, v
+    return None, None
+
+
 # ============================================================
 # Original video recording start (shared)
 # ============================================================
 
-def get_video_creation_time(video_path):
-    try:
-        probe = ffmpeg.probe(video_path)
-    except ffmpeg.Error as exc:
-        stderr = ""
-        if exc.stderr:
-            try:
-                stderr = exc.stderr.decode("utf-8", errors="replace")
-            except Exception:
-                stderr = str(exc.stderr)
-        raise RuntimeError(
-            "FFprobe failed while reading video metadata:\n\n" + stderr
-        )
+_PRIMARY_START_TAGS = (
+    "com.apple.quicktime.creationdate",
+    "Creation Date",
+    "creation date",
+    "creationdate",
+)
+_FALLBACK_START_TAGS = ("creation_time", "date", "datetime")
 
+
+def find_recording_start(probe):
+    """Return a dict describing the recording start and where it came from."""
     format_tags = probe.get("format", {}).get("tags", {})
     stream_tags = {}
     for stream in probe.get("streams", []):
@@ -348,23 +473,23 @@ def get_video_creation_time(video_path):
     all_tags.update(format_tags)
     all_tags.update(stream_tags)
 
-    creation_value = find_tag(
-        all_tags,
-        "com.apple.quicktime.creationdate",
-        "Creation Date",
-        "creation date",
-        "creationdate",
-    )
-    if creation_value:
-        recording_start = parse_video_datetime(creation_value)
-        if recording_start is not None:
-            return recording_start
-
-    fallback_value = find_tag(all_tags, "creation_time", "date", "datetime")
-    if fallback_value:
-        recording_start = parse_video_datetime(fallback_value)
-        if recording_start is not None:
-            return recording_start
+    for names, is_fallback in ((_PRIMARY_START_TAGS, False),
+                               (_FALLBACK_START_TAGS, True)):
+        tag_name, value = find_tag_named(all_tags, *names)
+        if not value:
+            continue
+        meta = {}
+        parsed = parse_video_datetime(value, meta)
+        if parsed is None:
+            continue
+        return {
+            "datetime": parsed,
+            "tag": tag_name,
+            "raw": str(value),
+            "is_fallback": is_fallback,
+            "tz_assumed": bool(meta.get("tz_assumed")),
+            "whole_seconds": "." not in str(value),
+        }
 
     raise RuntimeError(
         "Could not determine the original video recording start "
@@ -373,27 +498,65 @@ def get_video_creation_time(video_path):
     )
 
 
+def get_video_creation_time(video_path):
+    probe = run_ffprobe_json(
+        video_path, ["-show_format", "-show_streams"], "video metadata")
+    return find_recording_start(probe)["datetime"]
+
+
+def describe_recording_start(info):
+    """Human-readable lines about the timestamp base, incl. warnings."""
+    rs = info.get("recording_start_info") or {}
+    kind = "fallback tag" if rs.get("is_fallback") else "primary tag"
+    lines = [
+        f"Recording start source: {rs.get('tag')} ({kind}), "
+        f"raw value: {rs.get('raw')}"
+    ]
+    if rs.get("is_fallback"):
+        lines.append(
+            "  WARNING: fallback tags are usually UTC and, on non-Apple "
+            "devices, may mark the end of recording or the muxing time "
+            "rather than the start.")
+    if rs.get("tz_assumed"):
+        lines.append(
+            "  WARNING: the tag has no timezone; this computer's current "
+            "timezone was assumed.")
+    if rs.get("whole_seconds"):
+        lines.append(
+            "  NOTE: the tag has whole-second precision; the millisecond "
+            "digits in filenames are relative to it, not absolute.")
+    return lines
+
+
+def exif_offset_tags_available():
+    try:
+        return all(hasattr(piexif.ExifIFD, name)
+                   for name in ("OffsetTimeOriginal", "OffsetTimeDigitized"))
+    except Exception:
+        return False
+
+
 # ============================================================
 # Video information (shared)
 # ============================================================
 
 def get_video_info(video_path):
-    try:
-        probe = ffmpeg.probe(video_path)
-    except ffmpeg.Error as exc:
-        stderr = ""
-        if exc.stderr:
-            try:
-                stderr = exc.stderr.decode("utf-8", errors="replace")
-            except Exception:
-                stderr = str(exc.stderr)
-        raise RuntimeError("FFprobe failed:\n\n" + stderr)
+    probe = run_ffprobe_json(
+        video_path, ["-show_format", "-show_streams"], "video metadata")
 
+    # First real video stream. Attached pictures (cover art) are skipped;
+    # the ordinal among video streams is what -select_streams v:N and
+    # -map 0:v:N expect, and is used consistently by both methods.
     video_stream = None
+    video_ordinal = 0
     for stream in probe.get("streams", []):
-        if stream.get("codec_type") == "video":
-            video_stream = stream
-            break
+        if stream.get("codec_type") != "video":
+            continue
+        if (stream.get("disposition") or {}).get("attached_pic") == 1:
+            video_ordinal += 1
+            continue
+        video_stream = stream
+        break
     if video_stream is None:
         raise RuntimeError("No video stream was found.")
 
@@ -424,6 +587,17 @@ def get_video_info(video_path):
         except (ValueError, TypeError):
             pass
 
+    time_base = None
+    tb_text = video_stream.get("time_base")
+    if tb_text and "/" in tb_text:
+        tb_num, tb_den = tb_text.split("/", 1)
+        try:
+            tb_num, tb_den = float(tb_num), float(tb_den)
+            if tb_den != 0 and tb_num > 0:
+                time_base = tb_num / tb_den
+        except (ValueError, TypeError):
+            pass
+
     width = video_stream.get("width")
     height = video_stream.get("height")
     codec = video_stream.get("codec_name")
@@ -442,7 +616,7 @@ def get_video_info(video_path):
     except (ValueError, TypeError):
         format_start_time = 0.0
 
-    recording_start = get_video_creation_time(video_path)
+    recording_start_info = find_recording_start(probe)
 
     return {
         "duration": duration,
@@ -452,7 +626,10 @@ def get_video_info(video_path):
         "codec": codec,
         "start_time": start_time,
         "format_start_time": format_start_time,
-        "recording_start": recording_start,
+        "recording_start": recording_start_info["datetime"],
+        "recording_start_info": recording_start_info,
+        "video_ordinal": video_ordinal,
+        "time_base": time_base,
     }
 
 
@@ -512,6 +689,24 @@ def write_frame_exif(filepath, frame_time, video_path, method="pts"):
     piexif.insert(piexif.dump(exif_dict), filepath)
 
 
+def write_frame_manifest(output_folder, records):
+    """Writes the frame metadata to both CSV and JSON formats."""
+    if not records:
+        return None, None
+        
+    csv_path = os.path.join(output_folder, MANIFEST_CSV_NAME)
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=records[0].keys())
+        writer.writeheader()
+        writer.writerows(records)
+        
+    json_path = os.path.join(output_folder, MANIFEST_JSON_NAME)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2)
+        
+    return csv_path, json_path
+
+
 def apply_windows_timestamps_batch(timestamp_records, progress_callback=None):
     if not SET_WINDOWS_FILE_TIMESTAMPS:
         return
@@ -558,52 +753,63 @@ def calculate_expected_frame_count(duration, fps):
 # PTS-mode helpers
 # ============================================================
 
-def get_source_frame_pts(video_path):
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-select_streams", "v:0",
-        "-show_packets",
-        "-show_entries", "packet=pts_time,dts_time",
-        "-of", "json",
-        video_path,
-    ]
+def _to_float_or_none(value):
+    if value is None:
+        return None
     try:
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                "FFprobe failed while reading source frame PTS:\n\n"
-                + result.stderr
-            )
-        probe = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Failed to parse FFprobe JSON output:\n\n{exc}")
-    except Exception as exc:
-        raise RuntimeError(f"FFprobe execution failed:\n\n{exc}")
+        number = float(value)
+    except (ValueError, TypeError):
+        return None          # includes the literal string "N/A"
+    return number if math.isfinite(number) else None
+
+
+def get_source_frame_pts(video_path, stream_ordinal=0, stats=None):
+    """Presentation timestamps of the frames the decoder will OUTPUT.
+
+    Packets flagged 'D' (discard) are needed to keep decoder state but
+    never produce an output frame (typical after stream-copy trimming:
+    pre-roll frames with negative PTS). Counting them shifted every
+    frame index used by the select filter.
+    """
+    probe = run_ffprobe_json(
+        video_path,
+        ["-select_streams", f"v:{stream_ordinal}",
+         "-show_packets",
+         "-show_entries", "packet=pts_time,dts_time,flags"],
+        "source frame PTS",
+    )
 
     packets = probe.get("packets", [])
     if not packets:
         raise RuntimeError("FFprobe returned no video packets.")
 
     source_pts = []
+    discarded = 0
+    unusable = 0
     for pkt in packets:
-        pts_value = pkt.get("pts_time")
-        if pts_value is None:
-            pts_value = pkt.get("dts_time")
-        if pts_value is None:
+        if "D" in (pkt.get("flags") or ""):
+            discarded += 1
             continue
-        try:
-            pts = float(pts_value)
-        except (ValueError, TypeError):
+        pts = _to_float_or_none(pkt.get("pts_time"))
+        if pts is None:
+            pts = _to_float_or_none(pkt.get("dts_time"))
+        if pts is None:
+            unusable += 1
             continue
         source_pts.append({"pts": pts})
 
+    if stats is not None:
+        stats["packets_total"] = len(packets)
+        stats["packets_discarded"] = discarded
+        stats["packets_unusable"] = unusable
+
+    if unusable:
+        # Skipping them silently would shift every later frame index.
+        raise RuntimeError(
+            f"{unusable} video packet(s) have neither a usable PTS nor "
+            "DTS. Frame indices cannot be trusted for this file, so "
+            "PTS-grid extraction was stopped.\n\n"
+            "Use the FPS grid method, or remux the video first.")
     if not source_pts:
         raise RuntimeError("No usable source-frame PTS values were found.")
 
@@ -613,15 +819,15 @@ def get_source_frame_pts(video_path):
     return source_pts
 
 
-def select_source_frames(source_pts, fps):
-    if fps <= 0:
-        raise ValueError("FPS must be greater than zero.")
+def select_source_frames(source_pts, fps, stats=None):
+    fps = validate_fps(fps)
     if not source_pts:
         raise ValueError("source_pts must not be empty.")
 
     first_pts = source_pts[0]["pts"]
     interval = 1.0 / fps
     selected = []
+    skipped_duplicates = 0
     source_count = len(source_pts)
     source_position = 0
     target_number = 0
@@ -643,6 +849,7 @@ def select_source_frames(source_pts, fps):
                 source_position += 1
         if (selected and best["index"]
                 == selected[-1]["source_index"]):
+            skipped_duplicates += 1
             target_number += 1
             continue
         selected.append({
@@ -652,6 +859,10 @@ def select_source_frames(source_pts, fps):
             "actual_pts": best["pts"],
         })
         target_number += 1
+
+    if stats is not None:
+        stats["skipped_duplicates"] = skipped_duplicates
+        stats["grid_positions"] = target_number
 
     if not selected:
         raise RuntimeError("No source frames could be selected.")
@@ -739,7 +950,34 @@ def summarize_selection_errors(errors_ms):
     }
 
 
-def extract_selected_frames_pts(video_path, temp_pattern, selected_frames):
+_SHOWINFO_RE = re.compile(r"\bpts:\s*(-?\d+)\s+pts_time:\s*(\S+)")
+
+
+def parse_showinfo_pts(stderr_text, time_base=None):
+    """PTS values (seconds) of the frames that passed the select filter.
+
+    showinfo prints pts_time with only ~6 significant digits, so the
+    integer pts is multiplied by the stream time base when known.
+    """
+    values = []
+    for line in stderr_text.splitlines():
+        if "showinfo" not in line:
+            continue
+        match = _SHOWINFO_RE.search(line)
+        if not match:
+            continue
+        if time_base:
+            values.append(int(match.group(1)) * time_base)
+        else:
+            try:
+                values.append(float(match.group(2)))
+            except ValueError:
+                continue
+    return values
+
+
+def extract_selected_frames_pts(video_path, temp_pattern, selected_frames,
+                                stream_ordinal=0, time_base=None):
     if not selected_frames:
         raise RuntimeError("No selected frames.")
 
@@ -747,12 +985,17 @@ def extract_selected_frames_pts(video_path, temp_pattern, selected_frames):
     os.makedirs(temp_folder, exist_ok=True)
 
     select_expression = build_select_expression(selected_frames)
-    filter_expression = "select=" + select_expression
+    # showinfo is used ONLY to verify, afterwards, that FFmpeg passed
+    # exactly the frames that were intended. It is not a timestamp source.
+    filter_expression = "select=" + select_expression + ",showinfo"
 
+    # -copyts: keep raw container timestamps so the verification compares
+    # like with like (without it FFmpeg rebases by the file start_time).
     command = [
-        "ffmpeg", "-y",
+        _FFMPEG_EXE, "-y",
+        "-copyts",
         "-i", video_path,
-        "-map", "0:v:0",
+        "-map", f"0:v:{stream_ordinal}",
     ]
 
     filter_script_path = None
@@ -765,12 +1008,8 @@ def extract_selected_frames_pts(video_path, temp_pattern, selected_frames):
     else:
         command.extend(["-vf", filter_expression])
 
-    command.extend([
-        "-an",
-        "-fps_mode", "vfr",
-        "-q:v", str(JPEG_QUALITY),
-        temp_pattern,
-    ])
+    command.extend(["-an"] + list(_VFR_ARGS)
+                   + ["-q:v", str(JPEG_QUALITY), temp_pattern])
 
     extraction_start = time.perf_counter()
     try:
@@ -835,7 +1074,84 @@ def extract_selected_frames_pts(video_path, temp_pattern, selected_frames):
             f"JPEG files generated: {actual}\n\n"
             f"Complete FFmpeg log:\n{log_path}"
         )
-    return temp_files, extraction_seconds, log_path
+
+    # ---- verification: did FFmpeg pass the frames we intended? ----
+    shown = parse_showinfo_pts(stderr, time_base)
+    expected_pts = [item["actual_pts"] for item in selected_frames]
+    problem = None
+    max_error = 0.0
+    mismatches = []
+    if len(shown) != expected:
+        problem = (f"FFmpeg's showinfo reported {len(shown)} selected "
+                   f"frames; {expected} were expected.")
+    else:
+        for number, (want, got) in enumerate(zip(expected_pts, shown),
+                                             start=1):
+            error = abs(got - want)
+            tolerance = (PTS_VERIFY_TOLERANCE_S if time_base
+                         else max(PTS_VERIFY_TOLERANCE_S,
+                                  6e-6 * abs(want)))
+            max_error = max(max_error, error)
+            if error > tolerance:
+                mismatches.append((number, want, got))
+        if mismatches:
+            lines = [
+                f"  output {n:06d}: expected PTS {w:.6f} s, "
+                f"FFmpeg selected PTS {g:.6f} s"
+                for (n, w, g) in mismatches[:5]
+            ]
+            problem = (
+                f"{len(mismatches)} of {expected} frames differ from the "
+                "intended PTS:\n" + "\n".join(lines))
+
+    with open(log_path, "a", encoding="utf-8", errors="replace") as handle:
+        handle.write("\nPTS VERIFICATION (showinfo vs. ffprobe selection):\n")
+        if problem is None:
+            handle.write(f"PASSED: {expected} frames, "
+                         f"max |delta| = {max_error * 1000.0:.4f} ms\n")
+        else:
+            handle.write("FAILED: " + problem + "\n")
+
+    if problem is not None:
+        raise RuntimeError(
+            "PTS verification failed: the frames FFmpeg selected are not "
+            "the frames chosen from the ffprobe timestamps, so the "
+            "filenames/EXIF would be wrong. No output was written.\n\n"
+            + problem + "\n\n"
+            "Typical cause: a file whose decoder drops frames that ffprobe "
+            "still lists (stream-copy trimmed, damaged or open-GOP "
+            "streams). The FPS grid method can still be used.\n\n"
+            f"Complete FFmpeg log:\n{log_path}")
+
+    verification = {"checked": expected,
+                    "max_abs_error_ms": max_error * 1000.0}
+    return temp_files, extraction_seconds, log_path, verification
+
+
+# ============================================================
+# Existing-output detection (shared)
+# ============================================================
+
+def find_existing_frame_files(output_folder):
+    """Frames written by an earlier run (same filename scheme)."""
+    if not os.path.isdir(output_folder):
+        return []
+    found = []
+    for name in os.listdir(output_folder):
+        path = os.path.join(output_folder, name)
+        if OUTPUT_FRAME_PATTERN.match(name) and os.path.isfile(path):
+            found.append(path)
+    return sorted(found)
+
+
+def delete_files(paths):
+    failed = []
+    for path in paths:
+        try:
+            os.remove(path)
+        except OSError:
+            failed.append(path)
+    return failed
 
 
 # ============================================================
@@ -845,8 +1161,7 @@ def extract_selected_frames_pts(video_path, temp_pattern, selected_frames):
 def extract_frames_pts(video_path, output_folder, fps,
                        progress_callback=None):
     total_start = time.perf_counter()
-    if fps <= 0:
-        raise ValueError("FPS must be greater than zero.")
+    fps = validate_fps(fps)
     os.makedirs(output_folder, exist_ok=True)
 
     metadata_start = time.perf_counter()
@@ -857,11 +1172,15 @@ def extract_frames_pts(video_path, output_folder, fps,
     recording_start = info["recording_start"]
 
     pts_start = time.perf_counter()
-    source_pts = get_source_frame_pts(video_path)
+    packet_stats = {}
+    source_pts = get_source_frame_pts(
+        video_path, info["video_ordinal"], packet_stats)
     pts_seconds = time.perf_counter() - pts_start
 
     selection_start = time.perf_counter()
-    selected_frames = select_source_frames(source_pts, fps)
+    selection_stats = {}
+    selected_frames = select_source_frames(
+        source_pts, fps, selection_stats)
     selection_seconds = time.perf_counter() - selection_start
 
     if not selected_frames:
@@ -887,12 +1206,16 @@ def extract_frames_pts(video_path, output_folder, fps,
     temp_pattern = os.path.join(temp_folder, "frame_%08d.jpg")
 
     try:
-        temp_files, ffmpeg_seconds, _ffmpeg_log = extract_selected_frames_pts(
-            video_path, temp_pattern, selected_frames)
+        (temp_files, ffmpeg_seconds, _ffmpeg_log,
+         verification) = extract_selected_frames_pts(
+            video_path, temp_pattern, selected_frames,
+            stream_ordinal=info["video_ordinal"],
+            time_base=info["time_base"])
 
         first_frame_pts = selected_frames[0]["actual_pts"]
         timestamp_records = []
         jpeg_records = []
+        manifest_records = []
         total = len(temp_files)
 
         exif_start = time.perf_counter()
@@ -913,6 +1236,18 @@ def extract_frames_pts(video_path, output_folder, fps,
             jpeg_bytes = os.path.getsize(output_file)
             jpeg_records.append((frame_number, output_filename, jpeg_bytes))
 
+            manifest_records.append({
+                "image_id": frame_number,
+                "file_name": output_filename,
+                "timestamp_utc": frame_time.isoformat(),
+                "timestamp_unix": frame_time.timestamp(),
+                "width": info["width"],
+                "height": info["height"],
+                "file_size_bytes": jpeg_bytes,
+                "frame_type": "pts_native",
+                "source_video": os.path.basename(video_path)
+            })
+
             write_frame_exif(output_file, frame_time, video_path, "pts")
 
             if SET_WINDOWS_FILE_TIMESTAMPS:
@@ -922,6 +1257,8 @@ def extract_frames_pts(video_path, output_folder, fps,
                 progress_callback(frame_number, total, frame_time,
                                   "extracting")
         exif_seconds = time.perf_counter() - exif_start
+
+        write_frame_manifest(output_folder, manifest_records)
 
         jpeg_stats = summarize_jpeg_sizes([r[2] for r in jpeg_records])
 
@@ -950,6 +1287,30 @@ def extract_frames_pts(video_path, output_folder, fps,
             handle.write(f"Source PTS count: {len(source_pts)}\n")
             handle.write(f"Selected frame count: {len(selected_frames)}\n")
             handle.write(f"Extracted JPEG count: {len(temp_files)}\n\n")
+
+            handle.write("SOURCE / TIMESTAMP CHECKS\n"
+                         "-------------------------\n")
+            for line in describe_recording_start(info):
+                handle.write(line + "\n")
+            handle.write(
+                f"Packets listed by ffprobe: "
+                f"{packet_stats.get('packets_total')}\n")
+            handle.write(
+                f"Packets excluded (discard flag, no output frame): "
+                f"{packet_stats.get('packets_discarded')}\n")
+            handle.write(
+                f"Grid positions skipped as duplicates: "
+                f"{selection_stats.get('skipped_duplicates')}\n")
+            handle.write(
+                f"FFmpeg frame-PTS verification: PASSED "
+                f"({verification['checked']} frames, max |delta| "
+                f"{verification['max_abs_error_ms']:.4f} ms)\n")
+            handle.write(
+                "EXIF OffsetTime tags: "
+                + ("written" if exif_offset_tags_available()
+                   else "NOT written (installed piexif has no "
+                        "OffsetTime definitions)")
+                + "\n\n")
 
             handle.write("TIMINGS\n-------\n")
             handle.write(f"Video metadata: {metadata_seconds:.6f} s\n")
@@ -1050,6 +1411,9 @@ def extract_frames_pts(video_path, output_folder, fps,
             "height": info["height"],
             "codec": info["codec"],
             "first_frame_pts": first_frame_pts,
+            "verification": verification,
+            "skipped_duplicates": selection_stats.get("skipped_duplicates", 0),
+            "packets_discarded": packet_stats.get("packets_discarded", 0),
             "selected_frames": selected_frames,
             "benchmark": {
                 "metadata_seconds": metadata_seconds,
@@ -1088,8 +1452,7 @@ def calculate_sampling_time(recording_start, frame_number, fps):
 def extract_frames_fps(video_path, output_folder, fps,
                        progress_callback=None):
     total_start = time.perf_counter()
-    if fps <= 0:
-        raise ValueError("FPS must be greater than zero.")
+    fps = validate_fps(fps)
     os.makedirs(output_folder, exist_ok=True)
 
     log_lines = []
@@ -1108,6 +1471,7 @@ def extract_frames_fps(video_path, output_folder, fps,
     duration = info["duration"]
     recording_start = info["recording_start"]
     expected_count = calculate_expected_frame_count(duration, fps)
+    source_fps = info["source_fps"]
 
     append_log("FPS-GRID EXTRACTION LOG")
     append_log("=======================")
@@ -1125,183 +1489,203 @@ def extract_frames_fps(video_path, output_folder, fps,
                + recording_start.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3])
     append_log("Timezone: "
                + (recording_start.strftime("%z") or "unknown"))
+    for line in describe_recording_start(info):
+        append_log(line)
     append_log(f"Duration: {duration:.3f} s")
     append_log("Source FPS (nominal): "
-               + (f"{info['source_fps']:.6f}"
-                  if info["source_fps"] else "unknown"))
+               + (f"{source_fps:.6f}" if source_fps else "unknown"))
     append_log(f"Resolution: {info['width']} x {info['height']}")
     append_log(f"Codec: {info['codec']}")
+    append_log("EXIF OffsetTime tags: "
+               + ("written" if exif_offset_tags_available()
+                  else "NOT written (installed piexif has no "
+                       "OffsetTime definitions)"))
+    rate_warning = bool(source_fps and fps > source_fps * 1.001)
+    if rate_warning:
+        append_log("")
+        append_log("WARNING: requested FPS exceeds the source frame rate.")
+        append_log("FFmpeg's fps filter DUPLICATES frames to fill the grid;")
+        append_log("duplicates are written as separate timestamped files.")
+        append_log("Use the PTS grid method to avoid duplicates.")
     append_log("")
 
     temp_folder = os.path.join(output_folder, "_temp_frames")
+    cleanup_temp_folder(temp_folder)
     os.makedirs(temp_folder, exist_ok=True)
-    for filename in os.listdir(temp_folder):
-        filepath = os.path.join(temp_folder, filename)
-        if os.path.isfile(filepath):
-            try:
-                os.remove(filepath)
-            except OSError:
-                pass
     temp_pattern = os.path.join(temp_folder, "frame_%08d.jpg")
 
-    stream = (
-        ffmpeg
-        .input(video_path)
-        .filter("fps", fps=fps)
-        .output(temp_pattern, **{"q:v": JPEG_QUALITY})
-        .overwrite_output()
-    )
-
-    try:
-        command_args = stream.get_args()
-    except Exception:
-        command_args = None
-
+    # Explicit stream selection: the same video stream that
+    # get_video_info() inspected (FFmpeg's default would pick the "best"
+    # video stream, which can differ in multi-stream files).
+    command = [
+        _FFMPEG_EXE, "-y",
+        "-i", video_path,
+        "-map", f"0:v:{info['video_ordinal']}",
+        "-vf", f"fps=fps={fps:.10g}",
+        "-an",
+        "-q:v", str(JPEG_QUALITY),
+        temp_pattern,
+    ]
     append_log("FFMPEG COMMAND:")
-    if command_args is not None:
-        append_log(subprocess.list2cmdline(["ffmpeg"] + list(command_args)))
-    else:
-        append_log("(command unavailable)")
+    append_log(subprocess.list2cmdline(command))
     append_log("")
 
-    ffmpeg_start = time.perf_counter()
+    failure_logged = False
     try:
-        _stdout, stderr_bytes = stream.run(
-            capture_stdout=True, capture_stderr=True)
-        ffmpeg_stderr = (
-            stderr_bytes.decode("utf-8", errors="replace")
-            if stderr_bytes else ""
-        )
-    except ffmpeg.Error as exc:
-        ffmpeg_seconds = time.perf_counter() - ffmpeg_start
-        ffmpeg_stderr = ""
-        if exc.stderr:
-            try:
-                ffmpeg_stderr = exc.stderr.decode(
-                    "utf-8", errors="replace")
-            except Exception:
-                ffmpeg_stderr = str(exc.stderr)
-        append_log("RESULT: FAILED")
-        append_log(f"FFmpeg time: {ffmpeg_seconds:.6f} s")
-        append_log("")
-        append_log("FFMPEG STDERR:")
-        append_log(ffmpeg_stderr)
-        flush_log()
-        raise RuntimeError(
-            "FFmpeg extraction failed:\n\n" + ffmpeg_stderr)
-
-    ffmpeg_seconds = time.perf_counter() - ffmpeg_start
-
-    temp_files = sorted(
-        os.path.join(temp_folder, f)
-        for f in os.listdir(temp_folder)
-        if f.lower().endswith(".jpg")
-    )
-    produced_count = len(temp_files)
-    if not temp_files:
-        append_log("RESULT: FAILED")
-        append_log(f"FFmpeg time: {ffmpeg_seconds:.6f} s")
-        append_log("")
-        append_log("FFmpeg produced no JPEG frames.")
-        append_log("")
-        append_log("FFMPEG STDERR:")
-        append_log(ffmpeg_stderr)
-        flush_log()
-        raise RuntimeError("FFmpeg did not produce any JPEG frames.")
-
-    usable_count = min(produced_count, expected_count)
-    timestamp_records = []
-    per_frame_records = []
-
-    exif_start = time.perf_counter()
-    for index in range(usable_count):
-        frame_number = index + 1
-        sampling_time = calculate_sampling_time(
-            recording_start, frame_number, fps)
-
-        output_filename = make_frame_filename(sampling_time, frame_number)
-        output_file = os.path.join(output_folder, output_filename)
-        temp_file = temp_files[index]
-
-        if os.path.exists(output_file):
-            os.remove(output_file)
-        os.replace(temp_file, output_file)
-
-        write_frame_exif(output_file, sampling_time, video_path, "fps")
-
-        per_frame_records.append((
-            frame_number,
-            sampling_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
-            output_filename,
-        ))
-
-        if SET_WINDOWS_FILE_TIMESTAMPS:
-            timestamp_records.append((output_file, sampling_time))
-
-        if progress_callback:
-            progress_callback(frame_number, usable_count, sampling_time,
-                              "extracting")
-    exif_seconds = time.perf_counter() - exif_start
-
-    try:
-        for filename in os.listdir(temp_folder):
-            filepath = os.path.join(temp_folder, filename)
-            if os.path.isfile(filepath):
-                try:
-                    os.remove(filepath)
-                except OSError:
-                    pass
+        ffmpeg_start = time.perf_counter()
         try:
-            os.rmdir(temp_folder)
-        except OSError:
-            pass
-    except OSError:
-        pass
+            process = subprocess.run(
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except FileNotFoundError:
+            raise RuntimeError(
+                "FFmpeg executable was not found.\n\n"
+                "Use the 'Locate FFmpeg folder...' button to point the "
+                "application at the folder containing ffmpeg.exe and "
+                "ffprobe.exe.")
+        ffmpeg_seconds = time.perf_counter() - ffmpeg_start
+        ffmpeg_stderr = _decode_bytes(process.stderr)
 
-    filesystem_start = time.perf_counter()
-    if SET_WINDOWS_FILE_TIMESTAMPS:
-        def fs_progress(cur, tot, st):
+        if process.returncode != 0:
+            append_log("RESULT: FAILED")
+            append_log(f"FFmpeg time: {ffmpeg_seconds:.6f} s")
+            append_log(f"FFmpeg return code: {process.returncode}")
+            append_log("")
+            append_log("FFMPEG STDERR:")
+            append_log(ffmpeg_stderr)
+            failure_logged = True
+            flush_log()
+            raise RuntimeError(
+                "FFmpeg extraction failed:\n\n" + ffmpeg_stderr)
+
+        temp_files = sorted(
+            os.path.join(temp_folder, f)
+            for f in os.listdir(temp_folder)
+            if f.lower().endswith(".jpg")
+        )
+        produced_count = len(temp_files)
+        if not temp_files:
+            append_log("RESULT: FAILED")
+            append_log(f"FFmpeg time: {ffmpeg_seconds:.6f} s")
+            append_log("")
+            append_log("FFmpeg produced no JPEG frames.")
+            append_log("")
+            append_log("FFMPEG STDERR:")
+            append_log(ffmpeg_stderr)
+            failure_logged = True
+            flush_log()
+            raise RuntimeError("FFmpeg did not produce any JPEG frames.")
+
+        usable_count = min(produced_count, expected_count)
+        timestamp_records = []
+        per_frame_records = []
+        manifest_records = []
+
+        exif_start = time.perf_counter()
+        for index in range(usable_count):
+            frame_number = index + 1
+            sampling_time = calculate_sampling_time(
+                recording_start, frame_number, fps)
+
+            output_filename = make_frame_filename(
+                sampling_time, frame_number)
+            output_file = os.path.join(output_folder, output_filename)
+            temp_file = temp_files[index]
+
+            if os.path.exists(output_file):
+                os.remove(output_file)
+            os.replace(temp_file, output_file)
+
+            file_size_bytes = os.path.getsize(output_file)
+
+            per_frame_records.append((
+                frame_number,
+                sampling_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                output_filename,
+            ))
+
+            manifest_records.append({
+                "image_id": frame_number,
+                "file_name": output_filename,
+                "timestamp_utc": sampling_time.isoformat(),
+                "timestamp_unix": sampling_time.timestamp(),
+                "width": info["width"],
+                "height": info["height"],
+                "file_size_bytes": file_size_bytes,
+                "frame_type": "fps_sampled",
+                "source_video": os.path.basename(video_path)
+            })
+
+            write_frame_exif(output_file, sampling_time, video_path, "fps")
+
+            if SET_WINDOWS_FILE_TIMESTAMPS:
+                timestamp_records.append((output_file, sampling_time))
+
             if progress_callback:
-                progress_callback(cur, tot, st, "filesystem")
-        apply_windows_timestamps_batch(timestamp_records, fs_progress)
-    filesystem_seconds = time.perf_counter() - filesystem_start
-    total_seconds = time.perf_counter() - total_start
+                progress_callback(frame_number, usable_count,
+                                  sampling_time, "extracting")
+        exif_seconds = time.perf_counter() - exif_start
 
-    append_log("RESULT: SUCCESS")
-    append_log("")
-    append_log("COUNTS:")
-    append_log(f"  Expected output frames: {expected_count}")
-    append_log(f"  FFmpeg produced:        {produced_count}")
-    append_log(f"  Used:                   {usable_count}")
-    if produced_count != expected_count:
+        write_frame_manifest(output_folder, manifest_records)
+
+        filesystem_start = time.perf_counter()
+        if SET_WINDOWS_FILE_TIMESTAMPS:
+            def fs_progress(cur, tot, st):
+                if progress_callback:
+                    progress_callback(cur, tot, st, "filesystem")
+            apply_windows_timestamps_batch(timestamp_records, fs_progress)
+        filesystem_seconds = time.perf_counter() - filesystem_start
+        total_seconds = time.perf_counter() - total_start
+
+        append_log("RESULT: SUCCESS")
         append_log("")
-        append_log("  NOTE: produced != expected.")
-        append_log("  The expected count is an output-grid estimate.")
-        append_log("  FFmpeg's actual output count is authoritative for")
-        append_log("  the generated files. No source-PTS correction is applied.")
-    append_log("")
-    append_log("TIMINGS:")
-    append_log(f"  FFmpeg extraction:   {ffmpeg_seconds:.6f} s")
-    append_log(f"  Rename + EXIF:       {exif_seconds:.6f} s")
-    append_log(f"  Windows timestamps:  {filesystem_seconds:.6f} s")
-    append_log(f"  TOTAL:               {total_seconds:.6f} s")
-    append_log("")
-    append_log("Windows filesystem timestamp mode: "
-               + ("FINAL BATCH PASS"
-                  if SET_WINDOWS_FILE_TIMESTAMPS else "DISABLED"))
-    append_log("")
-    append_log("FFMPEG STDERR:")
-    append_log(ffmpeg_stderr)
-    append_log("")
-    append_log("PER-FRAME OUTPUT MAP:")
-    append_log("frame  sampling_time          filename")
-    for (rec_number, rec_time, rec_filename) in per_frame_records:
-        append_log(f"{rec_number:06d}  {rec_time}  {rec_filename}")
-    append_log("")
-    append_log("Timestamp semantics: output sampling time,")
-    append_log("not source-frame PTS.")
+        append_log("COUNTS:")
+        append_log(f"  Expected output frames: {expected_count}")
+        append_log(f"  FFmpeg produced:        {produced_count}")
+        append_log(f"  Used:                   {usable_count}")
+        if produced_count != expected_count:
+            append_log("")
+            append_log("  NOTE: produced != expected.")
+            append_log("  The expected count is an output-grid estimate.")
+            append_log("  FFmpeg's actual output count is authoritative for")
+            append_log("  the generated files. No source-PTS correction is "
+                       "applied.")
+            if produced_count > expected_count:
+                append_log(f"  {produced_count - expected_count} surplus "
+                           "frame(s) were NOT written to the output folder.")
+        append_log("")
+        append_log("TIMINGS:")
+        append_log(f"  FFmpeg extraction:   {ffmpeg_seconds:.6f} s")
+        append_log(f"  Rename + EXIF:       {exif_seconds:.6f} s")
+        append_log(f"  Windows timestamps:  {filesystem_seconds:.6f} s")
+        append_log(f"  TOTAL:               {total_seconds:.6f} s")
+        append_log("")
+        append_log("Windows filesystem timestamp mode: "
+                   + ("FINAL BATCH PASS"
+                      if SET_WINDOWS_FILE_TIMESTAMPS else "DISABLED"))
+        append_log("")
+        append_log("FFMPEG STDERR:")
+        append_log(ffmpeg_stderr)
+        append_log("")
+        append_log("PER-FRAME OUTPUT MAP:")
+        append_log("frame  sampling_time          filename")
+        for (rec_number, rec_time, rec_filename) in per_frame_records:
+            append_log(f"{rec_number:06d}  {rec_time}  {rec_filename}")
+        append_log("")
+        append_log("Timestamp semantics: output sampling time,")
+        append_log("not source-frame PTS.")
 
-    log_path = flush_log()
+        log_path = flush_log()
+    except Exception as exc:
+        if not failure_logged:
+            append_log("RESULT: FAILED")
+            append_log(f"{type(exc).__name__}: {exc}")
+            try:
+                flush_log()
+            except OSError:
+                pass
+        raise
+    finally:
+        cleanup_temp_folder(temp_folder)
 
     return {
         "method": "fps",
@@ -1316,6 +1700,7 @@ def extract_frames_fps(video_path, output_folder, fps,
         "height": info["height"],
         "codec": info["codec"],
         "log_path": log_path,
+        "rate_warning": rate_warning,
         "benchmark": {
             "ffmpeg_seconds": ffmpeg_seconds,
             "exif_seconds": exif_seconds,
@@ -1519,10 +1904,17 @@ class VideoFrameExtractorApp:
         self.ffmpeg_info = info
 
         if info["ok"]:
+            configure_ffmpeg(info)
             source_label = "Custom folder" if info["source"] == "custom" else "PATH"
             exe_path = info['ffmpeg_exe']
+            compat_note = ""
+            if info.get("fps_mode_supported") is False:
+                compat_note = (
+                    "\nNote: this FFmpeg lacks -fps_mode (needs 5.1+); "
+                    "using the older -vsync fallback.")
             self.ffmpeg_status_var.set(
                 f"FFmpeg {info['ffmpeg_version']}\n{source_label}: {exe_path}"
+                f"{compat_note}"
             )
             try:
                 self.ffmpeg_status_label.configure(style="FFmpegOK.TLabel")
@@ -1684,9 +2076,7 @@ class VideoFrameExtractorApp:
             start_time = info["start_time"]
             format_start_time = info["format_start_time"]
 
-            extraction_fps = float(self.fps_var.get())
-            if extraction_fps <= 0:
-                raise ValueError("FPS must be greater than zero.")
+            extraction_fps = validate_fps(self.fps_var.get())
             expected_count = calculate_expected_frame_count(
                 duration, extraction_fps)
             interval = 1.0 / extraction_fps
@@ -1704,6 +2094,14 @@ class VideoFrameExtractorApp:
             metadata.append(f"Resolution: {width} x {height}")
             metadata.append(f"Codec: {codec}")
             metadata.append(f"Video stream start_time: {start_time:.6f} s")
+            metadata.append("")
+
+            for line in describe_recording_start(info):
+                metadata.append(line)
+            if source_fps and extraction_fps > source_fps * 1.001:
+                metadata.append(
+                    "WARNING: selected FPS exceeds the source frame rate "
+                    "(PTS grid skips duplicates; FPS grid duplicates frames).")
             metadata.append("")
 
             metadata.append(f"Selected FPS: {extraction_fps:g}")
@@ -1854,12 +2252,9 @@ class VideoFrameExtractorApp:
             return
 
         try:
-            fps = float(self.fps_var.get())
-            if fps <= 0:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror(
-                "Invalid FPS", "FPS must be greater than zero.")
+            fps = validate_fps(self.fps_var.get())
+        except ValueError as exc:
+            messagebox.showerror("Invalid FPS", str(exc))
             return
 
         method = self.method_var.get()
@@ -1924,6 +2319,19 @@ class VideoFrameExtractorApp:
                 "the output folder."
             )
 
+        warning_lines = [
+            line.strip() for line in describe_recording_start(info)
+            if line.strip().startswith(("WARNING", "NOTE"))
+        ]
+        if info["source_fps"] and fps > info["source_fps"] * 1.001:
+            warning_lines.append(
+                "WARNING: FPS exceeds the source frame rate "
+                + ("(PTS grid will skip duplicate grid positions)."
+                   if method == "pts"
+                   else "(FPS grid will write duplicated frames)."))
+        warning_block = (
+            "\n\n" + "\n".join(warning_lines)) if warning_lines else ""
+
         confirmation = (
             "Extraction settings:\n\n"
             f"FPS: {fps:g}\n"
@@ -1933,10 +2341,33 @@ class VideoFrameExtractorApp:
             f"{recording_start_text}"
             f"{filesystem_mode}\n\n"
             f"{method_block}"
+            f"{warning_block}"
         )
 
         if not messagebox.askyesno("Start extraction", confirmation):
             return
+
+        existing_frames = find_existing_frame_files(output_folder)
+        if existing_frames:
+            answer = messagebox.askyesnocancel(
+                "Existing frames found",
+                f"The output folder already contains "
+                f"{len(existing_frames)} frame JPEG(s) from an earlier "
+                "run.\n\nLeaving them would mix old and new frames "
+                "(different FPS or method give different filenames).\n\n"
+                "Yes = delete them first\n"
+                "No = keep them (outputs will be mixed)\n"
+                "Cancel = abort")
+            if answer is None:
+                return
+            if answer:
+                failed = delete_files(existing_frames)
+                if failed:
+                    messagebox.showwarning(
+                        "Some files not deleted",
+                        f"{len(failed)} file(s) could not be deleted "
+                        "(in use or read-only). They remain in the "
+                        "output folder.")
 
         self.extract_button.configure(state="disabled")
         self.read_metadata_button.configure(state="disabled")
@@ -1995,6 +2426,17 @@ class VideoFrameExtractorApp:
                 else:
                     sel_line = ""
 
+                verification = result["verification"]
+                check_line = (
+                    "FFmpeg PTS verification: passed "
+                    f"({verification['checked']} frames, max |delta| "
+                    f"{verification['max_abs_error_ms']:.3f} ms)\n")
+                if result["skipped_duplicates"]:
+                    check_line += (
+                        f"Grid positions skipped as duplicates: "
+                        f"{result['skipped_duplicates']}\n")
+                check_line += "\n"
+
                 messagebox.showinfo(
                     "Extraction complete",
                     (
@@ -2011,11 +2453,14 @@ class VideoFrameExtractorApp:
                         f"{benchmark['exif_seconds']:.3f} s\n"
                         f"Total: "
                         f"{benchmark['total_seconds']:.3f} s\n\n"
-                        f"{sel_line}{jpeg_line}"
+                        f"{sel_line}{check_line}{jpeg_line}"
                         "FFmpeg diagnostic log:\n"
                         f"{os.path.join(output_folder, PTS_FFMPEG_LOG_NAME)}\n\n"
                         "Benchmark log:\n"
-                        f"{result['benchmark_path']}"
+                        f"{result['benchmark_path']}\n\n"
+                        f"Manifests written:\n"
+                        f"{os.path.join(output_folder, MANIFEST_CSV_NAME)}\n"
+                        f"{os.path.join(output_folder, MANIFEST_JSON_NAME)}"
                     ))
             else:
                 messagebox.showinfo(
@@ -2034,7 +2479,10 @@ class VideoFrameExtractorApp:
                         "  not source-frame PTS\n\n"
                         f"Recording start:\n{recording_start_text}\n\n"
                         f"Output folder:\n{output_folder}\n\n"
-                        f"Run log:\n{result['log_path']}"
+                        f"Run log:\n{result['log_path']}\n\n"
+                        f"Manifests written:\n"
+                        f"{os.path.join(output_folder, MANIFEST_CSV_NAME)}\n"
+                        f"{os.path.join(output_folder, MANIFEST_JSON_NAME)}"
                     ))
 
         except Exception as exc:
